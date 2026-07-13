@@ -6,12 +6,14 @@ import pytest
 
 from deployment_drift import (
     CONFIG_ERROR,
+    ConfigError,
     LIVE_UNAVAILABLE,
     MISSING_IN_CODE,
     MISSING_IN_SPEC,
     Operation,
     STALE_ALLOWANCE,
     build_report,
+    extract_flask_inventory,
     extract_flask_operations,
     format_json,
     format_text,
@@ -19,6 +21,7 @@ from deployment_drift import (
     main,
     probe_live,
     request_head,
+    validate_live_base_url,
 )
 
 
@@ -73,6 +76,123 @@ app.add_url_rule("/api/alias/<path:name>", endpoint="alias", view_func=health)
         Operation("PATCH", "/api/items/{item_id}"),
         Operation("GET", "/api/alias/{name}"),
     }
+
+
+def test_extracts_qualified_constructors_aliases_keyword_rules_and_registration_override(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text(
+        """
+import flask as web
+from flask import Blueprint as BlueprintFactory
+
+application = web.Flask(__name__)
+site = application
+routes = BlueprintFactory("api", __name__, url_prefix="/declared")
+route_alias = routes
+site.register_blueprint(blueprint=route_alias, url_prefix="/mounted")
+
+@route_alias.get(rule="/items/<int:item_id>")
+def item(item_id): pass
+
+@site.route(rule="/keyword", methods=["POST"])
+def keyword(): pass
+
+site.add_url_rule(rule="/alias", endpoint="alias", view_func=keyword)
+""",
+        encoding="utf-8",
+    )
+
+    inventory = extract_flask_inventory([source])
+
+    assert inventory.declared == {
+        Operation("GET", "/mounted/items/{item_id}"),
+        Operation("POST", "/keyword"),
+        Operation("GET", "/alias"),
+    }
+    assert Operation("GET", "/declared/items/{item_id}") not in inventory.declared
+    assert Operation("HEAD", "/mounted/items/{item_id}") in inventory.implicit
+    assert Operation("OPTIONS", "/keyword") in inventory.implicit
+
+
+def test_unsupported_qualified_route_owner_fails_visibly(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text(
+        """
+@container.app.get("/hidden")
+def hidden(): pass
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="unsupported route owner 'container.app'"):
+        extract_flask_operations([source])
+
+
+def test_cross_file_blueprint_prefix_override_fails_instead_of_inventing_path(tmp_path):
+    app_source = tmp_path / "app.py"
+    blueprint_source = tmp_path / "routes.py"
+    app_source.write_text(
+        """
+from flask import Flask
+from routes import routes
+app = Flask(__name__)
+app.register_blueprint(routes, url_prefix="/mounted")
+""",
+        encoding="utf-8",
+    )
+    blueprint_source.write_text(
+        """
+from flask import Blueprint
+routes = Blueprint("routes", __name__, url_prefix="/declared")
+@routes.get("/items")
+def items(): pass
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="cannot resolve url_prefix override for imported blueprint"):
+        extract_flask_operations([app_source, blueprint_source])
+
+
+def test_implicit_head_and_options_satisfy_openapi_without_missing_spec_noise(tmp_path):
+    _write_project(
+        tmp_path,
+        """
+from flask import Flask
+app = Flask(__name__)
+@app.get("/api/resource")
+def resource(): pass
+""",
+        [("GET", "/api/resource"), ("HEAD", "/api/resource"), ("OPTIONS", "/api/resource")],
+    )
+
+    report = build_report(tmp_path, _config())
+
+    assert report["status"] == "pass"
+    assert report["drift"]["missing_in_code"] == []
+    assert report["drift"]["missing_in_spec"] == []
+    assert report["inventory"]["application_operations"] == 1
+    assert report["inventory"]["application_effective_operations"] == 3
+
+
+def test_disabling_automatic_options_keeps_openapi_options_missing(tmp_path):
+    _write_project(
+        tmp_path,
+        """
+from flask import Flask
+app = Flask(__name__)
+@app.get("/api/resource", provide_automatic_options=False)
+def resource(): pass
+""",
+        [("GET", "/api/resource"), ("HEAD", "/api/resource"), ("OPTIONS", "/api/resource")],
+    )
+
+    report = build_report(tmp_path, _config())
+
+    assert report["drift"]["missing_in_code"] == [
+        {"method": "OPTIONS", "path": "/api/resource"}
+    ]
+    assert report["drift"]["missing_in_spec"] == []
 
 
 def test_report_separates_missing_in_code_and_missing_in_spec(tmp_path):
@@ -192,12 +312,12 @@ def test_live_fixtures_are_encoded_and_missing_fixtures_do_not_request():
     results = probe_live(
         [Operation("GET", "/api/videos/{video_id}"), Operation("GET", "/api/agents/{agent_name}")],
         "https://example.test/base",
-        {"video_id": "folder/value"},
+        {"video_id": "folder value"},
         2.5,
         available,
     )
 
-    assert calls == [("https://example.test/base/api/videos/folder%2Fvalue", 2.5)]
+    assert calls == [("https://example.test/base/api/videos/folder%20value", 2.5)]
     assert results[0]["reason"] == "missing_fixture:agent_name"
     assert results[1]["available"] is True
     assert results[1]["reason"] == "route_present"
@@ -263,6 +383,53 @@ def test_live_base_url_requires_explicit_live_flag(tmp_path, capsys):
     assert "inert without explicit --live" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://[::1",
+        "https://example.test:not-a-port",
+        "https://example.test:70000",
+    ],
+)
+def test_malformed_live_urls_return_cli_config_error(tmp_path, capsys, base_url):
+    _write_project(tmp_path, "from flask import Flask\napp = Flask(__name__)\n", [])
+    (tmp_path / "deployment-drift.json").write_text(json.dumps(_config()), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "--repo-root",
+            str(tmp_path),
+            "--live",
+            "--live-base-url",
+            base_url,
+        ]
+    )
+
+    assert exit_code == CONFIG_ERROR
+    assert "invalid live base URL" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("base_url", ["https://[::1", "https://host.test:bad", "https://host.test:99999"])
+def test_malformed_live_urls_raise_config_error(base_url):
+    with pytest.raises(ConfigError, match="invalid live base URL"):
+        validate_live_base_url(base_url)
+
+
+@pytest.mark.parametrize(
+    "fixture",
+    ["", "   ", ".", "..", "folder/value", "folder\\value", "%2e%2e", "%2Fadmin", "%252e%252e"],
+)
+def test_fixture_values_must_be_safe_single_segments(fixture):
+    with pytest.raises(ConfigError, match="fixture value"):
+        probe_live(
+            [Operation("GET", "/api/videos/{video_id}")],
+            "https://example.test",
+            {"video_id": fixture},
+            1,
+            lambda url, timeout: pytest.fail("unsafe fixture attempted a request"),
+        )
+
+
 def test_canaries_reject_mutating_methods(tmp_path):
     _write_project(tmp_path, "from flask import Flask\napp = Flask(__name__)\n", [])
 
@@ -270,7 +437,7 @@ def test_canaries_reject_mutating_methods(tmp_path):
         build_report(tmp_path, _config(canaries=["POST /api/mutate"]))
 
 
-@pytest.mark.parametrize("timeout", [0, -1, True, "not-a-number"])
+@pytest.mark.parametrize("timeout", [0, -1, True, "not-a-number", float("inf"), float("-inf"), float("nan")])
 def test_timeout_must_be_a_positive_number(tmp_path, timeout):
     _write_project(tmp_path, "from flask import Flask\napp = Flask(__name__)\n", [])
 
@@ -284,6 +451,8 @@ def test_repository_configs_are_valid_offline():
 
     assert policy["status"] == "pass"
     assert policy["inventory"]["openapi_operations"] == 24
+    assert policy["inventory"]["application_operations"] == 347
+    assert len(policy["drift"]["missing_in_code"]) == 19
     assert canary["status"] == "pass"
     assert canary["inventory"]["canary_operations"] == 14
 

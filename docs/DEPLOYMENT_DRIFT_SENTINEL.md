@@ -9,6 +9,12 @@ BoTTube or changing a deployment:
 
 The application inventory uses Python's AST. It does not import
 `bottube_server.py`, start services, or initialize BoTTube databases.
+It recognizes Flask/Blueprint constructor import aliases, local app or blueprint
+aliases, `rule=` registrations, and local `app.register_blueprint(...,
+url_prefix=...)` overrides. A qualified route owner or cross-file prefix override
+that cannot be resolved fails visibly with exit code 64 instead of guessing a
+route path. Add the relevant source or assign the owner to a local alias when
+that happens.
 
 ## Offline Check
 
@@ -32,6 +38,14 @@ The report keeps the drift classes separate:
   operations.
 - `live_unavailable`: safe expected routes that returned 404, 405, or 5xx, lacked
   a fixture, or could not be reached.
+
+The application count distinguishes declared operations from effective Flask
+operations. Flask automatically supplies HEAD for GET and normally supplies
+OPTIONS for every route. Those implicit operations may satisfy matching OpenAPI
+operations, but they are not treated as declared application operations and do
+not create `missing_in_spec` noise. A literal
+`provide_automatic_options=False` is honored; unsupported dynamic route metadata
+fails rather than being inferred.
 
 `deployment-drift.json` records the collaboration operations currently
 documented but absent from `bottube_server.py` as known drift. They remain in
@@ -62,6 +76,8 @@ changes the target. A 2xx, 3xx, 400, 401, 402, 403, or 429 response proves that 
 route exists; 404, 405, and 5xx responses are unavailable. HEAD is not retried as
 GET, so a service that does not support Flask's normal automatic HEAD handling
 will be reported unavailable rather than receiving a less conservative request.
+Malformed IPv6 hosts and invalid or out-of-range ports are configuration errors,
+as are non-positive or non-finite timeout values.
 
 OpenAPI GET and HEAD operations are probed by default. Set
 `live_probe_openapi_reads` to `false` when a config should probe only its explicit
@@ -101,10 +117,13 @@ python3 deployment_drift.py \
   --live-base-url https://staging.example.test
 ```
 
-Fixture values are percent-encoded as one path segment. Missing fixtures are
-reported as `live_unavailable`; no request is attempted. Use stable public
-canary objects because an application-level 404 cannot be distinguished from a
-missing route by an external observer.
+Fixture values must be nonempty, single path segments. Literal or percent-encoded
+slashes, backslashes, control characters, `.` and `..` dot segments, repeated
+encoding that could normalize into traversal, and excessively nested encoding
+are rejected before any request. Accepted values are percent-encoded as one path
+segment. Missing fixtures are reported as `live_unavailable`; no request is
+attempted. Use stable public canary objects because an application-level 404
+cannot be distinguished from a missing route by an external observer.
 
 ## Exit Codes
 

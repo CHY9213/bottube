@@ -13,6 +13,7 @@ import argparse
 import ast
 import fnmatch
 import json
+import math
 import re
 import sys
 import urllib.error
@@ -68,6 +69,18 @@ class Operation:
         return {"method": self.method, "path": self.path}
 
 
+@dataclass
+class FlaskInventory:
+    """Declared Flask operations plus methods Flask adds automatically."""
+
+    declared: set[Operation]
+    implicit: set[Operation]
+
+    @property
+    def effective(self) -> set[Operation]:
+        return self.declared | self.implicit
+
+
 def normalize_path(path: str) -> str:
     """Normalize Flask converters to OpenAPI parameter syntax."""
     if not isinstance(path, str) or not path.startswith("/"):
@@ -108,24 +121,232 @@ def _call_owner(call: ast.Call) -> tuple[str, str] | None:
     return call.func.value.id, call.func.attr
 
 
-def _blueprint_prefixes(tree: ast.AST, source: Path) -> dict[str, str]:
-    prefixes: dict[str, str] = {}
+def _qualified_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _qualified_name(node.value)
+        if parent:
+            return parent + "." + node.attr
+    return None
+
+
+def _assignment_targets(node: ast.Assign | ast.AnnAssign) -> list[str]:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    return [target.id for target in targets if isinstance(target, ast.Name)]
+
+
+def _flask_constructor_names(tree: ast.AST) -> tuple[set[str], set[str]]:
+    flask_modules: set[str] = set()
+    app_factories: set[str] = set()
+    blueprint_factories: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "flask":
+                    flask_modules.add(alias.asname or "flask")
+        elif isinstance(node, ast.ImportFrom) and node.module == "flask":
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                if alias.name == "Flask":
+                    app_factories.add(local_name)
+                elif alias.name == "Blueprint":
+                    blueprint_factories.add(local_name)
+    app_factories.update(module + ".Flask" for module in flask_modules)
+    blueprint_factories.update(module + ".Blueprint" for module in flask_modules)
+    return app_factories, blueprint_factories
+
+
+def _discover_route_owners(
+    tree: ast.AST,
+    source: Path,
+    configured_app_names: set[str],
+) -> tuple[set[str], dict[str, set[str]]]:
+    app_factories, blueprint_factories = _flask_constructor_names(tree)
+    assignments = [node for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))]
+    app_owners = set(configured_app_names)
+    blueprint_canonical: dict[str, str] = {}
+    declared_prefixes: dict[str, str] = {}
+
+    for node in assignments:
         value = node.value
         if not isinstance(value, ast.Call):
             continue
-        func_name = value.func.id if isinstance(value.func, ast.Name) else None
-        if func_name != "Blueprint":
+        constructor = _qualified_name(value.func)
+        targets = _assignment_targets(node)
+        if constructor in app_factories:
+            app_owners.update(targets)
+        elif constructor in blueprint_factories:
+            prefix_node = _keyword(value, "url_prefix")
+            prefix = "" if prefix_node is None else _literal_string(
+                prefix_node, f"{source}:{node.lineno}: Blueprint url_prefix"
+            )
+            for target in targets:
+                blueprint_canonical[target] = target
+                declared_prefixes[target] = prefix
+
+    changed = True
+    while changed:
+        changed = False
+        for node in assignments:
+            if not isinstance(node.value, ast.Name):
+                continue
+            value_name = node.value.id
+            for target in _assignment_targets(node):
+                if value_name in app_owners and target not in app_owners:
+                    app_owners.add(target)
+                    changed = True
+                canonical = blueprint_canonical.get(value_name)
+                if canonical is not None and blueprint_canonical.get(target) != canonical:
+                    blueprint_canonical[target] = canonical
+                    changed = True
+
+    registration_prefixes: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
             continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        prefix_node = _keyword(value, "url_prefix")
-        prefix = "" if prefix_node is None else _literal_string(prefix_node, f"{source}: Blueprint url_prefix")
-        for target in targets:
-            if isinstance(target, ast.Name):
-                prefixes[target.id] = prefix
-    return prefixes
+        owner = _call_owner(node)
+        if owner is None or owner[0] not in app_owners or owner[1] != "register_blueprint":
+            continue
+        blueprint_node = node.args[0] if node.args else _keyword(node, "blueprint")
+        if blueprint_node is None:
+            raise ConfigError(f"{source}:{node.lineno}: register_blueprint has no blueprint")
+        if not isinstance(blueprint_node, ast.Name):
+            raise ConfigError(
+                f"{source}:{node.lineno}: qualified register_blueprint owner is unsupported; assign it a local alias"
+            )
+        canonical = blueprint_canonical.get(blueprint_node.id)
+        if canonical is None:
+            # Imported blueprints are outside this source file's configured inventory.
+            if _keyword(node, "url_prefix") is not None:
+                raise ConfigError(
+                    f"{source}:{node.lineno}: cannot resolve url_prefix override for imported blueprint "
+                    f"{blueprint_node.id!r}; declare and register it in one configured source"
+                )
+            continue
+        prefix_node = _keyword(node, "url_prefix")
+        if prefix_node is None or (isinstance(prefix_node, ast.Constant) and prefix_node.value is None):
+            prefix = declared_prefixes[canonical]
+        else:
+            prefix = _literal_string(prefix_node, f"{source}:{node.lineno}: register_blueprint url_prefix")
+        registration_prefixes.setdefault(canonical, set()).add(prefix)
+
+    effective_prefixes: dict[str, set[str]] = {}
+    for owner, canonical in blueprint_canonical.items():
+        effective_prefixes[owner] = registration_prefixes.get(canonical, {declared_prefixes[canonical]})
+    return app_owners, effective_prefixes
+
+
+def _rule_node(call: ast.Call) -> ast.AST | None:
+    if call.args:
+        return call.args[0]
+    return _keyword(call, "rule")
+
+
+def _declared_and_implicit_methods(
+    call: ast.Call,
+    shortcut: str,
+    context: str,
+) -> tuple[set[str], set[str]]:
+    if shortcut == "route" or shortcut == "add_url_rule":
+        methods_node = _keyword(call, "methods")
+        declared = {"GET"} if methods_node is None else _literal_methods(methods_node, context)
+    else:
+        declared = {shortcut.upper()}
+
+    automatic_options_node = _keyword(call, "provide_automatic_options")
+    if automatic_options_node is None:
+        automatic_options = True
+    elif isinstance(automatic_options_node, ast.Constant) and automatic_options_node.value is None:
+        automatic_options = True
+    elif isinstance(automatic_options_node, ast.Constant) and isinstance(automatic_options_node.value, bool):
+        automatic_options = automatic_options_node.value
+    else:
+        raise ConfigError(f"{context} provide_automatic_options must be a boolean literal")
+
+    implicit: set[str] = set()
+    if "GET" in declared and "HEAD" not in declared:
+        implicit.add("HEAD")
+    if automatic_options and "OPTIONS" not in declared:
+        implicit.add("OPTIONS")
+    return declared, implicit
+
+
+def extract_flask_inventory(
+    source_paths: Sequence[Path],
+    app_names: Iterable[str] = ("app",),
+) -> FlaskInventory:
+    """Extract declared and Flask-implicit operations without importing code."""
+    declared_operations: set[Operation] = set()
+    implicit_operations: set[Operation] = set()
+    configured_app_names = set(app_names)
+
+    for source in sorted(source_paths):
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        except (OSError, SyntaxError, UnicodeError) as exc:
+            raise ConfigError(f"could not parse application source {source}: {exc}") from exc
+
+        app_owners, blueprint_prefixes = _discover_route_owners(tree, source, configured_app_names)
+        route_owners = app_owners | set(blueprint_prefixes)
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for decorator in node.decorator_list:
+                    if not isinstance(decorator, ast.Call):
+                        continue
+                    decorator_name = decorator.func.attr if isinstance(decorator.func, ast.Attribute) else None
+                    if decorator_name not in {"route", "get", "post", "put", "patch", "delete"}:
+                        continue
+                    rule_node = _rule_node(decorator)
+                    if rule_node is None:
+                        raise ConfigError(f"{source}:{decorator.lineno}: route has no rule")
+                    if not isinstance(rule_node, ast.Constant) or not isinstance(rule_node.value, str):
+                        raise ConfigError(f"{source}:{decorator.lineno}: route rule must be a string literal")
+                    if not rule_node.value.startswith("/"):
+                        continue
+                    owner = _call_owner(decorator)
+                    if owner is None or owner[0] not in route_owners:
+                        qualified_owner = _qualified_name(decorator.func.value)
+                        raise ConfigError(
+                            f"{source}:{decorator.lineno}: unsupported route owner {qualified_owner!r}; "
+                            "assign Flask apps or blueprints to a local alias"
+                        )
+                    object_name = owner[0]
+                    route = rule_node.value
+                    context = f"{source}:{decorator.lineno}: route"
+                    methods, implicit_methods = _declared_and_implicit_methods(decorator, decorator_name, context)
+                    prefixes = blueprint_prefixes.get(object_name, {""})
+                    for prefix in prefixes:
+                        full_path = _join_route(prefix, route)
+                        declared_operations.update(Operation(method, full_path) for method in methods)
+                        implicit_operations.update(Operation(method, full_path) for method in implicit_methods)
+
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != "add_url_rule":
+                continue
+            rule_node = _rule_node(node)
+            if rule_node is None:
+                raise ConfigError(f"{source}:{node.lineno}: add_url_rule has no rule")
+            route = _literal_string(rule_node, f"{source}:{node.lineno}: add_url_rule rule")
+            owner = _call_owner(node)
+            if owner is None or owner[0] not in route_owners:
+                qualified_owner = _qualified_name(node.func.value)
+                raise ConfigError(
+                    f"{source}:{node.lineno}: unsupported add_url_rule owner {qualified_owner!r}; "
+                    "assign Flask apps or blueprints to a local alias"
+                )
+            context = f"{source}:{node.lineno}: add_url_rule"
+            methods, implicit_methods = _declared_and_implicit_methods(node, "add_url_rule", context)
+            prefixes = blueprint_prefixes.get(owner[0], {""})
+            for prefix in prefixes:
+                full_path = _join_route(prefix, route)
+                declared_operations.update(Operation(method, full_path) for method in methods)
+                implicit_operations.update(Operation(method, full_path) for method in implicit_methods)
+
+    implicit_operations.difference_update(declared_operations)
+    return FlaskInventory(declared_operations, implicit_operations)
 
 
 def _join_route(prefix: str, route: str) -> str:
@@ -137,59 +358,8 @@ def _join_route(prefix: str, route: str) -> str:
 
 
 def extract_flask_operations(source_paths: Sequence[Path], app_names: Iterable[str] = ("app",)) -> set[Operation]:
-    """Extract Flask decorator and add_url_rule registrations without imports."""
-    operations: set[Operation] = set()
-    configured_app_names = set(app_names)
-
-    for source in sorted(source_paths):
-        try:
-            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
-        except (OSError, SyntaxError, UnicodeError) as exc:
-            raise ConfigError(f"could not parse application source {source}: {exc}") from exc
-
-        prefixes = _blueprint_prefixes(tree, source)
-        route_owners = configured_app_names | set(prefixes)
-
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for decorator in node.decorator_list:
-                    if not isinstance(decorator, ast.Call):
-                        continue
-                    owner = _call_owner(decorator)
-                    if owner is None or owner[0] not in route_owners:
-                        continue
-                    object_name, decorator_name = owner
-                    if decorator_name not in {"route", "get", "post", "put", "patch", "delete"}:
-                        continue
-                    if not decorator.args:
-                        raise ConfigError(f"{source}:{decorator.lineno}: route has no path")
-                    route = _literal_string(decorator.args[0], f"{source}:{decorator.lineno}: route path")
-                    if decorator_name == "route":
-                        methods_node = _keyword(decorator, "methods")
-                        methods = {"GET"} if methods_node is None else _literal_methods(
-                            methods_node, f"{source}:{decorator.lineno}: route"
-                        )
-                    else:
-                        methods = {decorator_name.upper()}
-                    full_path = _join_route(prefixes.get(object_name, ""), route)
-                    operations.update(Operation(method, full_path) for method in methods)
-
-            if not isinstance(node, ast.Call):
-                continue
-            owner = _call_owner(node)
-            if owner is None or owner[0] not in route_owners or owner[1] != "add_url_rule":
-                continue
-            if not node.args:
-                raise ConfigError(f"{source}:{node.lineno}: add_url_rule has no path")
-            route = _literal_string(node.args[0], f"{source}:{node.lineno}: add_url_rule path")
-            methods_node = _keyword(node, "methods")
-            methods = {"GET"} if methods_node is None else _literal_methods(
-                methods_node, f"{source}:{node.lineno}: add_url_rule"
-            )
-            full_path = _join_route(prefixes.get(owner[0], ""), route)
-            operations.update(Operation(method, full_path) for method in methods)
-
-    return operations
+    """Extract explicitly declared Flask operations without importing code."""
+    return extract_flask_inventory(source_paths, app_names).declared
 
 
 def load_openapi_operations(path: Path) -> set[Operation]:
@@ -270,10 +440,34 @@ def _parse_fixtures(values: Sequence[str]) -> dict[str, str]:
         name, fixture = value.split("=", 1)
         if not name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
             raise ConfigError(f"invalid fixture name: {name!r}")
-        if not fixture:
-            raise ConfigError(f"fixture value must not be empty: {name}")
-        fixtures[name] = fixture
+        fixtures[name] = _fixture_segment(name, fixture)
     return fixtures
+
+
+def _fixture_segment(name: str, value: Any) -> str:
+    """Validate one fixture as a non-traversing URL path segment."""
+    segment = str(value)
+    if not segment or not segment.strip():
+        raise ConfigError(f"fixture value must not be empty: {name}")
+
+    decoded = segment
+    for _ in range(4):
+        if decoded in {".", ".."}:
+            raise ConfigError(f"fixture value must not be a dot segment: {name}")
+        if any(char in decoded for char in ("/", "\\")):
+            raise ConfigError(f"fixture value must be one path segment: {name}")
+        if any(ord(char) < 32 or ord(char) == 127 for char in decoded):
+            raise ConfigError(f"fixture value contains control characters: {name}")
+        next_value = urllib.parse.unquote(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+    else:
+        raise ConfigError(f"fixture value is excessively encoded: {name}")
+
+    if decoded in {".", ".."} or any(char in decoded for char in ("/", "\\")):
+        raise ConfigError(f"fixture value could normalize outside one path segment: {name}")
+    return segment
 
 
 def _timeout_seconds(value: Any) -> float:
@@ -283,7 +477,7 @@ def _timeout_seconds(value: Any) -> float:
         timeout = float(value)
     except (TypeError, ValueError) as exc:
         raise ConfigError("timeout must be a positive number") from exc
-    if timeout <= 0:
+    if not math.isfinite(timeout) or timeout <= 0:
         raise ConfigError("timeout must be a positive number")
     return timeout
 
@@ -295,7 +489,8 @@ def render_path(path: str, fixtures: Mapping[str, Any]) -> tuple[str | None, lis
         return None, missing
 
     def replace(match: re.Match[str]) -> str:
-        return urllib.parse.quote(str(fixtures[match.group(1)]), safe="")
+        name = match.group(1)
+        return urllib.parse.quote(_fixture_segment(name, fixtures[name]), safe="")
 
     return _OPENAPI_PARAMETER.sub(replace, path), []
 
@@ -321,13 +516,22 @@ def request_head(url: str, timeout: float) -> int:
 
 
 def validate_live_base_url(base_url: str) -> str:
-    parsed = urllib.parse.urlsplit(base_url)
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise ConfigError(f"invalid live base URL: {exc}") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ConfigError("live base URL must be an absolute http:// or https:// URL")
+    if hostname is None:
+        raise ConfigError("live base URL must include a valid hostname")
     if parsed.username is not None or parsed.password is not None:
         raise ConfigError("live base URL must not contain credentials")
     if parsed.query or parsed.fragment:
         raise ConfigError("live base URL must not contain a query string or fragment")
+    if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in base_url):
+        raise ConfigError("live base URL must not contain whitespace or control characters")
     return base_url.rstrip("/")
 
 
@@ -413,7 +617,9 @@ def build_report(
         raise ConfigError("application_names must be a list of strings")
 
     spec_operations = load_openapi_operations(openapi_path)
-    code_operations = extract_flask_operations(source_paths, app_names)
+    flask_inventory = extract_flask_inventory(source_paths, app_names)
+    code_operations = flask_inventory.declared
+    effective_code_operations = flask_inventory.effective
     canaries = _operation_list(config.get("canaries", []), "canaries")
     unsafe_canaries = canaries - {op for op in canaries if op.method in SAFE_LIVE_METHODS}
     if unsafe_canaries:
@@ -421,7 +627,7 @@ def build_report(
         raise ConfigError(f"canaries must be safe GET or HEAD routes: {labels}")
 
     expected_in_code = spec_operations | canaries
-    missing_in_code = expected_in_code - code_operations
+    missing_in_code = expected_in_code - effective_code_operations
 
     patterns = config.get("missing_in_spec_patterns", ["*"])
     if not isinstance(patterns, list) or not patterns or not all(isinstance(item, str) for item in patterns):
@@ -445,8 +651,16 @@ def build_report(
     config_fixtures = config.get("fixtures", {})
     if not isinstance(config_fixtures, Mapping):
         raise ConfigError("fixtures must be an object")
-    fixtures = {str(key): str(value) for key, value in config_fixtures.items()}
-    fixtures.update(fixture_overrides or {})
+    fixtures: dict[str, str] = {}
+    for key, value in config_fixtures.items():
+        name = str(key)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ConfigError(f"invalid fixture name: {name!r}")
+        fixtures[name] = _fixture_segment(name, value)
+    for name, value in (fixture_overrides or {}).items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ConfigError(f"invalid fixture name: {name!r}")
+        fixtures[name] = _fixture_segment(name, value)
     timeout = _timeout_seconds(config.get("timeout", 5))
 
     if live_enabled and not live_base_url:
@@ -496,6 +710,7 @@ def build_report(
         "exit_code": exit_code,
         "inventory": {
             "application_operations": len(code_operations),
+            "application_effective_operations": len(effective_code_operations),
             "application_sources": relative_sources,
             "canary_operations": len(canaries),
             "openapi": str(openapi_path.relative_to(repo_root)),
@@ -527,7 +742,8 @@ def format_text(report: Mapping[str, Any]) -> str:
     lines = [
         "BoTTube deployment drift sentinel",
         f"OpenAPI: {inventory['openapi']} ({inventory['openapi_operations']} operations)",
-        f"Application: {inventory['application_operations']} operations from "
+        f"Application: {inventory['application_operations']} declared, "
+        f"{inventory['application_effective_operations']} effective operations from "
         + ", ".join(inventory["application_sources"]),
         f"Canaries: {inventory['canary_operations']} operations",
         "Live: " + (f"enabled ({live['base_url']}, HEAD only)" if live["enabled"] else "disabled"),
