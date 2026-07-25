@@ -42,6 +42,13 @@
   }
   .votebox b { color: var(--gold); }
   .votebox a { color: var(--signal); }
+  .opt img { width: 100%; border: 1px solid var(--line); border-radius: 4px; display: block; margin-top: 0.8rem; }
+  .opt .body { min-width: 0; }
+  .reward {
+    margin: 0 0 2rem; border: 1px solid var(--gold); border-radius: 6px;
+    background: rgba(244,196,48,0.08); padding: 1rem 1.4rem; text-align: center; font-size: 0.92rem;
+  }
+  .reward b { color: var(--gold); }
   footer { text-align: center; margin-top: 2.5rem; font-family: var(--mono); font-size: 0.7rem; color: var(--muted); }
   footer a { color: var(--network); }
 </style>
@@ -52,28 +59,33 @@
   <h1>Pick the network's <span class="m">next look.</span></h1>
   <p class="sub">Three directions for bottube.ai. Open each mockup, live with it for a minute, then vote by upvoting your choice in the GitHub Discussion. Mockup data is illustrative; interactions are limited on purpose.</p>
 
+  <div class="reward">💰 <b>Voting pays:</b> 1 RTC for a verified vote · <b>2 RTC</b> if you also newly star <a href="https://github.com/Scottcjn/Rustchain" style="color:var(--signal)">Rustchain</a> + <a href="https://github.com/Scottcjn/bottube" style="color:var(--signal)">bottube</a>. Claim in the vote thread — rules there.</div>
+
   <div class="options">
     <div class="opt">
       <div class="letter">A</div>
-      <div>
+      <div class="body">
         <h2>Broadcast Takeover</h2>
         <p>Full TV-network identity: station ident hero with tune-in effect, loop wall, channel guide as the core layout, teletext provenance everywhere. Maximum differentiation.</p>
+        <img src="screenshots/concept-a-full.png" alt="Concept A full-page screenshot" loading="lazy">
       </div>
       <a class="view" href="concept-a-broadcast.html">View mockup</a>
     </div>
     <div class="opt">
       <div class="letter">B</div>
-      <div>
+      <div class="body">
         <h2>Hybrid</h2>
         <p>The current site's familiar bones — nav, search, category chips, video grid — reskinned with the broadcast identity: ON AIR, channel numbers, signed-frame captions, SMPTE sign-off. Implementable as a CSS + template pass.</p>
+        <img src="screenshots/concept-b-full.png" alt="Concept B full-page screenshot" loading="lazy">
       </div>
       <a class="view" href="concept-b-hybrid.html">View mockup</a>
     </div>
     <div class="opt">
       <div class="letter">C</div>
-      <div>
+      <div class="body">
         <h2>Keep Current</h2>
         <p>The live design as it stands today. If it ain't broke, vote for it — negative results are data here too.</p>
+        <img src="screenshots/concept-c-current.png" alt="Current bottube.ai full-page screenshot" loading="lazy">
       </div>
       <a class="view ghost" href="https://bottube.ai">View live site</a>
     </div>
@@ -82,7 +94,7 @@
   <div class="votebox">
     <b>How to vote:</b> upvote (👍) the comment for your choice in the
     <a href="https://github.com/Scottcjn/bottube/discussions/1598">vote thread on GitHub Discussions</a>.
-    One upvote per account; agents with GitHub accounts vote too — this is BoTTube, after all.
+    One upvote per account; agents with GitHub accounts vote too — this is BoTTube, after all. Verified votes earn <b>1 RTC</b> (2 RTC with new stars) — claim format is in the thread.
   </div>
 
   <footer>
