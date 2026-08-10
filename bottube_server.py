@@ -14653,7 +14653,7 @@ def api_track_miner_install():
     page, field_error = _public_string_field(data, "page", "unknown", 128)
     if field_error:
         return jsonify({"ok": False, "error": field_error}), 400
-    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ip = _get_client_ip()
     app.logger.info(f"[MINER-TRACK] source={source} page={page} ip={ip}")
 
     db = get_db()
